@@ -77,21 +77,22 @@ func FetchAPIsOnEvent(conf *config.Config, apiUUID *string, k8sClient client.Cli
 					logger.LoggerUtils.Infof("Selected Environment Label: %s", envLabel)
 
 					apkConf, _, apiUUID, revisionID, configuredRateLimitPoliciesMap, endpointSecurityData, api, prodAIRL, sandAIRL, apkErr := transformer.GenerateConf(artifact.APIJson, artifact.CertArtifact, artifact.Endpoints, apiDeployment.OrganizationID, envLabel)
-					if prodAIRL == nil {
+					
+					if apkErr != nil {
+						logger.LoggerUtils.Errorf("Unable to generate APK-Conf: %+v", apkErr)
+						return nil, err
+					}
+					if prodAIRL == nil && api != nil {
 						// Try to delete production AI ratelimit for this api
 						// !!!TODO: Might hava to change the implementation becuase now we use BackendTrafficPolicy + RoutePolicy
 						// k8sclientUtil.DeleteAIRatelimitPolicy(generateSHA1HexHash(api.Name, api.Version, "production"), k8sClient)
 						logger.LoggerUtils.Debugf("Trying to delete production AI ratelimit for API: %v", api.Name)
 					}
-					if sandAIRL == nil {
+					if sandAIRL == nil && api != nil {
 						// Try to delete sandbox AI ratelimit for this api
 						// !!!TODO: Might hava to change the implementation becuase now we use BackendTrafficPolicy + RoutePolicy
 						// k8sclientUtil.DeleteAIRatelimitPolicy(generateSHA1HexHash(api.Name, api.Version, "sandbox"), k8sClient)
 						logger.LoggerUtils.Debugf("Trying to delete sandbox AI ratelimit for API: %v", api.Name)
-					}
-					if apkErr != nil {
-						logger.LoggerUtils.Errorf("Unable to generate APK-Conf: %+v", apkErr)
-						return nil, err
 					}
 					certContainer := transformer.CertContainer{
 						ClientCertObj:   artifact.CertMeta,

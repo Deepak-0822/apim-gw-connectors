@@ -29,8 +29,8 @@ func (a *APKAPIYamlCreator) CreateAPIYaml(event *types.APICPEvent) (string, stri
 	logger.LoggerUtils.Infof("Creating APK API YAML for API: %s, Version: %s, UUID: %s",
 		event.API.APIName, event.API.APIVersion, event.API.APIUUID)
 
-	// Use the common agent's default CreateAPIYaml function which sets gatewayType to "wso2/apk"
-	apiYaml, definition, endpointsYaml := types.CreateAPIYaml(event)
+	// Use the common agent's default CreateAPIYaml function which sets gatewayType to "Envoy"
+	apiYaml, definition, endpointsYaml := types.CreateAPIYaml(event, "Envoy")
 
 	return apiYaml, definition, endpointsYaml
 }
