@@ -48,6 +48,11 @@ import java.util.List;
 public class EnvoyGatewayConfiguration implements GatewayAgentConfiguration {
 
     @Override
+    public String getGatewayDeployerImplementation() {
+        return EnvoyGatewayDeployer.class.getName();
+    }
+
+    @Override
     public String getImplementation() {
         // Deprecated method, kept for backward compatibility
         return getGatewayDeployerImplementation();
