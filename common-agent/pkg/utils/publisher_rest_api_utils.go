@@ -103,6 +103,12 @@ components:
           scopes: {}`
 )
 
+// APIRevisionsResponse represents the response body for listing API revisions
+type APIRevisionsResponse struct {
+	Count int                      `json:"count"`
+	List  []map[string]interface{} `json:"list"`
+}
+
 var (
 	tokenURL             string
 	apiImportURL         string
@@ -215,24 +221,24 @@ func GetSuitableAuthHeadervalue(scopes []string) (string, error) {
 }
 
 // ImportAPI imports an API from a zip file, returning the ID of the imported API.
-func ImportAPI(apiZipName string, zipFileBytes *bytes.Buffer) (string, string, error) {
+func ImportAPI(apiZipName string, zipFileBytes *bytes.Buffer) (string, string, bool, error) {
 	authHeaderVal, err := GetSuitableAuthHeadervalue([]string{string(AdminScope), string(ImportExportScope)})
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	part, err := writer.CreateFormFile("file", apiZipName)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 	if _, err := io.Copy(part, zipFileBytes); err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 	writer.Close()
 	req, err := http.NewRequest("POST", apiImportURL, body)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 
 	req.Header.Set("Authorization", authHeaderVal)
@@ -240,54 +246,146 @@ func ImportAPI(apiZipName string, zipFileBytes *bytes.Buffer) (string, string, e
 	req.Header.Set("Accept", "application/json")
 	resp, err := tlsutils.InvokeControlPlane(req, skipSSL)
 	if err != nil {
-		return "", "", err
+		// Transport/TLS/DNS/timeouts are typically retryable
+		return "", "", true, err
 	}
 	defer resp.Body.Close()
 	respBody, _ := ioutil.ReadAll(resp.Body)
 	logger.LoggerTLSUtils.Infof("For the API import we received response status: %s Status code: %d. API zip name %s, response body: %s", resp.Status, resp.StatusCode, apiZipName, string(respBody))
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		return "", "", fmt.Errorf("could not reach APIM. Received service unavailable reponse")
+	// Retryability based on status codes
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusAccepted:
+		// proceed
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout, http.StatusTooManyRequests:
+		return "", "", true, fmt.Errorf("import API returned retryable status %d: %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	default:
+		return "", "", false, fmt.Errorf("import API failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
 	// try to parse the body as json and extract id from the response.
 	var responseMap map[string]interface{}
 	if err := json.Unmarshal([]byte(respBody), &responseMap); err != nil {
 		logger.LoggerMgtServer.Errorf("Error while retriving id and revision from import response. Error: %+v", err)
-		return "", "", nil
+		return "", "", false, fmt.Errorf("failed to parse import response: %w", err)
 	}
 
 	// Assuming the response contains an ID field, you can extract it like this:
 	id, ok := responseMap["id"].(string)
 	revisionID, revisionOk := responseMap["revision"].(string)
 	if !ok || !revisionOk {
-		return "", "", nil
+		return "", "", false, fmt.Errorf("missing id or revision in import response")
 	}
-	return id, revisionID, nil
+	return id, revisionID, false, nil
 }
 
 // DeleteAPIRevision deletes an API given its UUID.
-func DeleteAPIRevision(apiUUID string, revisionID string, body string) error {
+func DeleteAPIRevision(apiUUID string, revisionID string, body string) (bool, error) {
 	deleteURL := apiDeleteURL + apiUUID + "/undeploy-revision?revisionId=" + revisionID
 	authheaderval, err := GetSuitableAuthHeadervalue([]string{string(AdminScope), string(ImportExportScope)})
 	if err != nil {
-		return err
+		return false, err
 	}
 	req, err := http.NewRequest("POST", deleteURL, bytes.NewBuffer([]byte(body)))
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	req.Header.Set("Authorization", authheaderval)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := tlsutils.InvokeControlPlane(req, skipSSL)
 	if err != nil {
-		logger.LoggerTLSUtils.Errorf("Error occured while sending undeploy revision request. Error: %+v", err)
-		return err
+		logger.LoggerTLSUtils.Errorf("Error occurred while sending undeploy revision request. Error: %+v", err)
+		// Transport/TLS/DNS/timeouts are typically retryable
+		return true, err
 	}
 	defer resp.Body.Close()
 	respBody, _ := ioutil.ReadAll(resp.Body)
 	logger.LoggerTLSUtils.Infof("For the API undeploy revision request we received response status %s, code: %+v, body: %+v", resp.Status, resp.StatusCode, string(respBody))
-	if resp.StatusCode == http.StatusServiceUnavailable {
-		return fmt.Errorf("could not reach APIM. Received service unavailable reponse")
+	// Decide retryability based on status codes
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusAccepted, http.StatusNoContent, http.StatusCreated:
+		// proceed
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout, http.StatusTooManyRequests:
+		return true, fmt.Errorf("undeploy revision returned retryable status %d: %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	default:
+		return false, fmt.Errorf("undeploy revision failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
-	return nil
+
+	// After undeploying the revision, delete the revision as well
+	revisionDeleteURL := apiDeleteURL + apiUUID + "/revisions/" + revisionID
+	delReq, err := http.NewRequest("DELETE", revisionDeleteURL, nil)
+	if err != nil {
+		return false, err
+	}
+	delReq.Header.Set("Authorization", authheaderval)
+	delReq.Header.Set("Accept", "application/json")
+
+	delResp, err := tlsutils.InvokeControlPlane(delReq, skipSSL)
+	if err != nil {
+		logger.LoggerTLSUtils.Errorf("Error occurred while sending delete revision request. Error: %+v", err)
+		// Transport-level errors are retryable
+		return true, err
+	}
+	defer delResp.Body.Close()
+	delRespBody, _ := ioutil.ReadAll(delResp.Body)
+	logger.LoggerTLSUtils.Infof("For the API delete revision request we received response status %s, code: %+v, body: %+v", delResp.Status, delResp.StatusCode, string(delRespBody))
+	// Decide retryability based on status codes
+	switch delResp.StatusCode {
+	case http.StatusOK, http.StatusAccepted, http.StatusNoContent:
+		// success
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout, http.StatusTooManyRequests:
+		return true, fmt.Errorf("delete revision returned retryable status %d: %s", delResp.StatusCode, http.StatusText(delResp.StatusCode))
+	default:
+		return false, fmt.Errorf("delete revision failed with status %d: %s", delResp.StatusCode, string(delRespBody))
+	}
+
+	// Success path: no retry needed
+	return false, nil
+}
+
+// ListAPIRevisions lists available revisions of an API. Optional query filters by deployment status, e.g., "deployed:true".
+// Returns the revisions (if any), a retryable flag indicating whether the caller should retry on error, and an error.
+func ListAPIRevisions(apiUUID string, query string) (*APIRevisionsResponse, bool, error) {
+	// Build URL: /apis/{apiId}/revisions?query=...
+	listURL := apiDeleteURL + apiUUID + "/revisions"
+	if strings.TrimSpace(query) != "" {
+		listURL = listURL + "?query=" + url.QueryEscape(query)
+	}
+
+	authHeaderVal, err := GetSuitableAuthHeadervalue([]string{string(AdminScope), string(ImportExportScope)})
+	if err != nil {
+		return nil, false, err
+	}
+
+	req, err := http.NewRequest("GET", listURL, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	req.Header.Set("Authorization", authHeaderVal)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := tlsutils.InvokeControlPlane(req, skipSSL)
+	if err != nil {
+		logger.LoggerTLSUtils.Errorf("Error occurred while sending list revisions request. Error: %+v", err)
+		// Transport/TLS/DNS/timeouts are typically retryable
+		return nil, true, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := ioutil.ReadAll(resp.Body)
+	logger.LoggerTLSUtils.Infof("For the API list revisions request we received response status %s, code: %+v, body: %+v", resp.Status, resp.StatusCode, string(respBody))
+	switch resp.StatusCode {
+	case http.StatusOK:
+		// proceed
+	case http.StatusServiceUnavailable, http.StatusBadGateway, http.StatusGatewayTimeout, http.StatusTooManyRequests:
+		return nil, true, fmt.Errorf("list revisions returned retryable status %d: %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	case http.StatusNotFound:
+		return nil, false, fmt.Errorf("API or revisions not found for apiId: %s", apiUUID)
+	default:
+		return nil, false, fmt.Errorf("unexpected response status: %s", resp.Status)
+	}
+
+	var revisions APIRevisionsResponse
+	if err := json.Unmarshal(respBody, &revisions); err != nil {
+		return nil, false, err
+	}
+	return &revisions, false, nil
 }

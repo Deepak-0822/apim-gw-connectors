@@ -29,7 +29,7 @@ rules:
     verbs: ["get","list","watch"]
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["httproutes","gateways"]
-    verbs: ["get","list","watch","update","delete","create"]
+    verbs: ["get","list","watch","update","delete","create", "patch"]
   - apiGroups: [ "gateway.networking.k8s.io" ]
     resources: [ "gateways/status" ]
     verbs: [ "get","patch","update" ]

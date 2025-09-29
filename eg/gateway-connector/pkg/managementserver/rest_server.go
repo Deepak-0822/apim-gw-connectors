@@ -77,10 +77,14 @@ func StartInternalServer(port uint) {
 				return
 			}
 			// Delete the api
-			errorUndeployRevision := utils.DeleteAPIRevision(event.API.APIUUID, event.API.RevisionID, string(jsonPayload))
-			if errorUndeployRevision != nil {
+			retryable, errUndeployRevision := utils.DeleteAPIRevision(event.API.APIUUID, event.API.RevisionID, string(jsonPayload))
+			if errUndeployRevision != nil {
 				logger.LoggerMgtServer.Errorf("Error while undeploying api revision. RevisionId: %s, API ID: %s . Sending error response to Adapter.", event.API.RevisionID, event.API.APIUUID)
-				c.JSON(http.StatusServiceUnavailable, errorUndeployRevision.Error())
+				if retryable {
+					c.JSON(http.StatusServiceUnavailable, errUndeployRevision.Error())
+				} else {
+					c.JSON(http.StatusInternalServerError, errUndeployRevision.Error())
+				}
 				return
 			}
 			c.JSON(http.StatusOK, map[string]string{"message": "Success"})
@@ -96,7 +100,7 @@ func StartInternalServer(port uint) {
 				}
 			}
 			logger.LoggerMgtServer.Infof("ssss", &event)
-			apiYaml, definition, endpointsYaml := mgtServer.CreateAPIYaml(&event)
+			apiYaml, definition, endpointsYaml := mgtServer.CreateAPIYaml(&event, "Envoy")
 			deploymentContent := mgtServer.CreateDeploymentYaml(event.API.Vhost)
 			logger.LoggerMgtServer.Debugf("Created apiYaml : %s, \n\n\n created definition file: %s, \n\n\n created endpointYaml : %s", apiYaml, definition, endpointsYaml)
 			definitionPath := fmt.Sprintf("%s-%s/Definitions/swagger.yaml", event.API.APIName, event.API.APIVersion)
@@ -138,10 +142,14 @@ func StartInternalServer(port uint) {
 				logger.LoggerMgtServer.Errorf("Error while creating apim zip file for api uuid: %s. Error: %+v", event.API.APIUUID, err)
 			}
 			logger.LoggerMgtServer.Infof("Creating zip file without endpoints")
-			id, revisionID, err := utils.ImportAPI(fmt.Sprintf("admin-%s-%s.zip", event.API.APIName, event.API.APIVersion), &buf)
+			id, revisionID, retryable, err := utils.ImportAPI(fmt.Sprintf("admin-%s-%s.zip", event.API.APIName, event.API.APIVersion), &buf)
 			if err != nil {
 				logger.LoggerMgtServer.Errorf("Error while importing API. Sending error response to Adapter.")
-				c.JSON(http.StatusServiceUnavailable, err.Error())
+				if retryable {
+					c.JSON(http.StatusServiceUnavailable, err.Error())
+				} else {
+					c.JSON(http.StatusInternalServerError, err.Error())
+				}
 				return
 			}
 			c.JSON(http.StatusOK, map[string]string{"id": id, "revisionID": revisionID})

@@ -39,6 +39,7 @@ const (
 	pkgSynchronizer = "github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/synchronizer"
 	pkgUtils        = "github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/utils"
 	pkgEventhub     = "github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/eventhub"
+	pkgWatcher      = "github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/discovery"
 )
 
 // logger package references
@@ -50,6 +51,7 @@ var (
 	LoggerUtils        logging.Log
 	LoggerAgent        logging.Log
 	LoggerEventhub     logging.Log
+	LoggerWatcher      logging.Log
 )
 
 func init() {
@@ -65,5 +67,6 @@ func UpdateLoggers() {
 	LoggerUtils = logging.InitPackageLogger(pkgUtils)
 	LoggerAgent = logging.InitPackageLogger(pkgAgent)
 	LoggerEventhub = logging.InitPackageLogger(pkgEventhub)
+	LoggerWatcher = logging.InitPackageLogger(pkgWatcher)
 	logrus.Info("Updated apk agent loggers")
 }

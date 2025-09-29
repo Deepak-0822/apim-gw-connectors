@@ -17,6 +17,12 @@
 
 package constants
 
+import (
+	"os"
+	"strconv"
+	"time"
+)
+
 // APIM Mediation constants
 const (
 	InterceptorService      = "CallInterceptorService"
@@ -27,8 +33,8 @@ const (
 	RedirectRequest         = "apkRedirectRequest"
 	ModelWeightedRoundRobin = "modelWeightedRoundRobin"
 	ModelRoundRobin         = "modelRoundRobin"
-	LuaInterceptorService  = "apkLuaInterceptorService"
-	WASMInterceptorService = "apkWASMInterceptorService"
+	LuaInterceptorService   = "apkLuaInterceptorService"
+	WASMInterceptorService  = "apkWASMInterceptorService"
 
 	// Version constants
 	V1 = "v1"
@@ -37,5 +43,40 @@ const (
 	// Policy Types
 	CommonType = "common"
 
-	DefaultKongAgentName = "Kong"
+	DefaultKongAgentName  = "Kong"
+	DefaultEnvoyAgentName = "EG"
+
+	// Default delay (in seconds) before re-queuing retryable events when processing CR events
+	DefaultEventRetryDelaySeconds = 5
 )
+
+// GetEnvoyAgentName returns the Envoy agent name, allowing override via APIM_AGENT_NAME env var.
+// This keeps consistency across modules when comparing agent names in events.
+func GetEnvoyAgentName() string {
+	if v := os.Getenv("APIM_AGENT_NAME"); v != "" {
+		return v
+	}
+	return DefaultEnvoyAgentName
+}
+
+// GetEventRetryDelay returns the delay to wait before re-queuing a retryable CR event.
+// It reads APIM_EVENT_RETRY_DELAY_SECONDS from the environment, falling back to a sane default.
+func GetEventRetryDelay() time.Duration {
+	if v := os.Getenv("APIM_EVENT_RETRY_DELAY_SECONDS"); v != "" {
+		if s, err := strconv.Atoi(v); err == nil && s > 0 {
+			return time.Duration(s) * time.Second
+		}
+	}
+	return time.Duration(DefaultEventRetryDelaySeconds) * time.Second
+}
+
+// DisableRetryFeature returns the delay to wait before re-queuing a retryable CR event.
+func DisableRetryFeature() bool {
+	if v := os.Getenv("APIM_DISABLE_RETRY"); v != "" {
+		disabled, err := strconv.ParseBool(v)
+		if err == nil {
+			return disabled
+		}
+	}
+	return false
+}

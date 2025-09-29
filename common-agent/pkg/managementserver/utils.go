@@ -30,7 +30,7 @@ import (
 )
 
 // CreateAPIYaml creates the API yaml content
-func CreateAPIYaml(apiCPEvent *APICPEvent) (string, string, string) {
+func CreateAPIYaml(apiCPEvent *APICPEvent, gatewayType string) (string, string, string) {
 	config, err := config.ReadConfigs()
 	provider := "admin"
 	if err == nil {
@@ -225,7 +225,7 @@ func CreateAPIYaml(apiCPEvent *APICPEvent) (string, string, string) {
 				// },
 			},
 			"policies":             []string{"Unlimited"},
-			"gatewayType":          "wso2/apk",
+			"gatewayType":          gatewayType,
 			"gatewayVendor":        "wso2",
 			"operations":           operations,
 			"additionalProperties": createAdditionalProperties(apiCPEvent.API.APIProperties),

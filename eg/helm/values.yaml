@@ -36,7 +36,7 @@ controlPlane:
   serviceURL: https://apim-wso2am-acp-1-service.default.svc.cluster.local:9443/ # change the ns to the appropriate ns
   username: admin
   password: admin
-  environmentLabels: Default
+  environmentLabels: EG
   skipSSLVerification: true
   eventListeningEndpoints: amqp://admin:admin@apim-wso2am-acp-1-service.default.svc.cluster.local:5672?retries='10'&connectdelay='30'  # change the ns to the appropriate ns
   # internalKeyIssuer: http://am.wso2.com:443/token
@@ -51,7 +51,8 @@ metrics:
   enabled: false
 agent:
   mode: CPtoDP
-  gateway: apk
+  gateway: eg
+  debug: true
 certmanager:
   enabled: true
 logging:
