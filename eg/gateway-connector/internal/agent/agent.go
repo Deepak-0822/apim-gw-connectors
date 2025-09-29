@@ -28,8 +28,9 @@ import (
 	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/loggers"
 	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/synchronizer"
 	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/pkg/managementserver"
+	commonManagementServer "github.com/wso2-extensions/apim-gw-connectors/common-agent/pkg/managementserver"
 	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/pkg/utils"
-
+    "github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/discovery"
 	gatewayv1alpha1 "github.com/envoyproxy/gateway/api/v1alpha1"
 	cpv1alpha2 "github.com/wso2/apk/common-go-libs/apis/cp/v1alpha2"
 	dpv2alpha1 "github.com/wso2/apk/common-go-libs/apis/dp/v2alpha1"
@@ -64,6 +65,10 @@ func initializeAPKIntegrations() {
 	loggers.LoggerAgent.Info("Starting APK integrations initialization")
 	apkAPIYamlCreator := utils.NewAPKAPIYamlCreator()
 	commonMgmt.SetAPIYamlCreator(apkAPIYamlCreator)
+
+	envoyCallback := &discovery.EnvoyAPIImportCallback{}
+	commonManagementServer.RegisterAPIImportCallback(envoyCallback)
+	loggers.LoggerAgent.Debugf("Successfully registered Envoy API import callback for discovery mode")
 }
 
 // Run starts the GRPC server and Rest API server.

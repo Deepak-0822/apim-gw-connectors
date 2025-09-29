@@ -31,10 +31,12 @@ import (
 	"github.com/wso2-extensions/apim-gw-connectors/common-agent/config"
 	commonDiscovery "github.com/wso2-extensions/apim-gw-connectors/common-agent/pkg/discovery"
 	"github.com/wso2-extensions/apim-gw-connectors/common-agent/pkg/managementserver"
+	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/constants"
 	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/loggers"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
@@ -54,6 +56,7 @@ func handleAddOrUpdateHTTPRoute(oldU, u *unstructured.Unstructured) {
 	// Find the group of routes to process (by shared apiNameLabel)
 	routes := []*unstructured.Unstructured{u}
 	if val, ok := u.GetLabels()[apiNameLabel]; ok && val != EmptyString {
+		loggers.LoggerWatcher.Debugf("EG grouping HTTPRoutes by label %s=%s", apiNameLabel, val)
 		routes = listHTTPRoutesByLabel(u.GetNamespace(), apiNameLabel, val)
 	}
 
@@ -84,10 +87,9 @@ func handleAddOrUpdateHTTPRoute(oldU, u *unstructured.Unstructured) {
 	// Build desired API payload. Name and version derived from labels
 	apiName := deriveAPIName(routes, apiNameLabel)
 	apiVersion := deriveAPIVersion(routes)
-	apiUUID := computeStableUUID(apiName, apiVersion, routes)
+	apiUUID, _ := getLabelValue(u, constants.LabelAPIUUID)
 
 	api := managementserver.API{
-		APIUUID:          apiUUID,
 		APIName:          apiName,
 		APIVersion:       apiVersion,
 		IsDefaultVersion: true,
@@ -99,20 +101,29 @@ func handleAddOrUpdateHTTPRoute(oldU, u *unstructured.Unstructured) {
 	updateAPIFromHTTPRoutes(&api, routes)
 
 	// Hash and queue if changed
-	newHash := computeAPIHash(api)
-	oldHash, exists := commonDiscovery.APIHashMap[apiUUID]
-	if !exists || oldHash != newHash {
-		commonDiscovery.APIHashMap[apiUUID] = newHash
-		commonDiscovery.APIMap[apiUUID] = api
-		commonDiscovery.QueueEvent(managementserver.CreateEvent, api, apiName, routes[0].GetNamespace(), "EG", apiUUID)
+	newHash := computeAPIHash(routes)
+	loggers.LoggerWatcher.Debugf("EG API hash unchanged: newHash=%s", newHash)
+	queue := false
+	if val, ok := u.GetLabels()[constants.LabelAPIHash]; ok && val != newHash {
+		loggers.LoggerWatcher.Debugf("EG API hash changed: oldHash=%s, newHash=%s", val, newHash)
+		queue = true
+	} else if !ok {
+		loggers.LoggerWatcher.Debugf("EG API hash missing, setting newHash=%s", newHash)
+		queue = true
+	}
+	if queue {
+		agentName := constants.GetAgentName()
+		commonDiscovery.QueueEvent(managementserver.CreateEvent, api, routes[0].GetName(), routes[0].GetNamespace(), agentName, apiUUID)
 		loggers.LoggerWatcher.Infof("EG queued API upsert: %s (%s)", apiName, apiUUID)
 	} else {
 		loggers.LoggerWatcher.Debugf("EG API unchanged: %s", apiUUID)
+
 	}
 }
 
 func listHTTPRoutesByLabel(namespace, key, value string) []*unstructured.Unstructured {
 	sel := fmt.Sprintf("%s=%s", key, value)
+	loggers.LoggerWatcher.Debugf("EG listing HTTPRoutes in %s with selector: %s", namespace, sel)
 	list, err := CRWatcher.DynamicClient.Resource(HTTPRouteGVR).Namespace(namespace).List(context.Background(), metav1.ListOptions{LabelSelector: sel})
 	if err != nil {
 		loggers.LoggerWatcher.Errorf("EG list HTTPRoutes by label failed: %v", err)
@@ -129,6 +140,7 @@ func listHTTPRoutesByLabel(namespace, key, value string) []*unstructured.Unstruc
 }
 
 func fetchOpenAPISpecFromConfigMap(namespace, name string) string {
+	loggers.LoggerWatcher.Debugf("EG fetching OpenAPI spec from ConfigMap %s/%s", namespace, name)
 	cm, err := CRWatcher.DynamicClient.Resource(ConfigMapGVR).Namespace(namespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		loggers.LoggerWatcher.Errorf("EG fetch ConfigMap %s/%s failed: %v", namespace, name, err)
@@ -277,10 +289,25 @@ func operationExists(ops []managementserver.OperationFromDP, newOp managementser
 	return false
 }
 
-func computeAPIHash(api managementserver.API) string {
-	data := fmt.Sprintf("%v%v%v%v%v", api.APIName, api.APIVersion, api.Definition, api.Vhost, api.Operations)
+func computeAPIHash(routes []*unstructured.Unstructured) string {
+	routeIds := make([]string, 0, len(routes))
+	for _, r := range routes {
+		if r == nil {
+			continue
+		}
+		id := fmt.Sprintf("%s_%d", r.GetName(), r.GetGeneration())
+		routeIds = append(routeIds, id)
+	}
+	sort.Strings(routeIds)
+	data := strings.Join(routeIds, "|")
 	sum := sha256.Sum256([]byte(data))
-	return hex.EncodeToString(sum[:])
+	fullHash := hex.EncodeToString(sum[:])
+
+	// Truncate to max 63 characters for Kubernetes label
+	if len(fullHash) > 63 {
+		return fullHash[:63]
+	}
+	return fullHash
 }
 
 func computeStableUUID(name, version string, routes []*unstructured.Unstructured) string {
@@ -335,26 +362,118 @@ func handleDeleteHTTPRoute(deleted *unstructured.Unstructured) {
 		}
 		// No routes remain, delete API from CP
 		apiVersion := deriveAPIVersion([]*unstructured.Unstructured{deleted})
-		apiUUID := computeStableUUID(apiName, apiVersion, []*unstructured.Unstructured{deleted})
-		if api, ok := commonDiscovery.APIMap[apiUUID]; ok {
-			delete(commonDiscovery.APIMap, apiUUID)
-			delete(commonDiscovery.APIHashMap, apiUUID)
-			commonDiscovery.QueueEvent(managementserver.DeleteEvent, api, apiName, deleted.GetNamespace(), "EG", apiUUID)
-			loggers.LoggerWatcher.Infof("EG queued API delete: %s (%s)", apiName, apiUUID)
-		} else {
-			loggers.LoggerWatcher.Debugf("EG no API found for delete request: %s (%s)", apiName, apiUUID)
+		apiUUID, _ := getLabelValue(deleted, constants.LabelAPIUUID)
+		revisionID := deleted.GetLabels()[constants.LabelRevisionID]
+		hostnames, _, _ := unstructured.NestedStringSlice(deleted.Object, "spec", "hostnames")
+		hostname := ""
+		if len(hostnames) > 0 {
+			hostname = hostnames[0]
 		}
+		api := managementserver.API{
+			APIUUID:    apiUUID,
+			APIName:    apiName,
+			APIVersion: apiVersion,
+			RevisionID: revisionID,
+			Vhost:      hostname,
+		}
+		loggers.LoggerWatcher.Infof("EG prepared API for delete: %+v", api)
+		agentName := constants.GetAgentName()
+		commonDiscovery.QueueEvent(managementserver.DeleteEvent, api, apiName, deleted.GetNamespace(), agentName, apiUUID)
+		loggers.LoggerWatcher.Infof("EG queued API delete: %s (%s)", apiName, apiUUID)
 		return
 	}
 
 	// If no API name label, treat the deleted route as a single-route API; recompute UUID with its own name
 	apiName = deleted.GetName()
-	apiVersion := deriveAPIVersion([]*unstructured.Unstructured{deleted})
-	apiUUID := computeStableUUID(apiName, apiVersion, []*unstructured.Unstructured{deleted})
-	if api, ok := commonDiscovery.APIMap[apiUUID]; ok {
-		delete(commonDiscovery.APIMap, apiUUID)
-		delete(commonDiscovery.APIHashMap, apiUUID)
-		commonDiscovery.QueueEvent(managementserver.DeleteEvent, api, apiName, deleted.GetNamespace(), "EG", apiUUID)
-		loggers.LoggerWatcher.Infof("EG queued single-route API delete: %s (%s)", apiName, apiUUID)
+	apiUUID, _ := getLabelValue(deleted, constants.LabelAPIUUID)
+	apiRevisionId, _ := deleted.GetLabels()[constants.LabelRevisionID]
+	hostnames, _, _ := unstructured.NestedStringSlice(deleted.Object, "spec", "hostnames")
+	hostname := ""
+	if len(hostnames) > 0 {
+		hostname = hostnames[0]
 	}
+	api := managementserver.API{
+		APIUUID:    apiUUID,
+		APIName:    apiName,
+		APIVersion: deriveAPIVersion([]*unstructured.Unstructured{deleted}),
+		RevisionID: apiRevisionId,
+		Vhost:      hostname,
+	}
+	agentName := constants.GetAgentName()
+	commonDiscovery.QueueEvent(managementserver.DeleteEvent, api, apiName, deleted.GetNamespace(), agentName, apiUUID)
+
+}
+
+func getHttpRouteByNameAndNamespace(name, namespace string) (*unstructured.Unstructured, error) {
+	if CRWatcher == nil || CRWatcher.DynamicClient == nil {
+		return nil, fmt.Errorf("CRWatcher or DynamicClient is not initialized")
+	}
+
+	loggers.LoggerWatcher.Debugf("EG fetching HTTPRoute %s/%s", namespace, name)
+	httpRoute, err := CRWatcher.DynamicClient.Resource(HTTPRouteGVR).Namespace(namespace).Get(
+		context.Background(),
+		name,
+		metav1.GetOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return httpRoute, nil
+}
+
+func getAllRelatedHttpRoutes(name, namespace string) ([]*unstructured.Unstructured, error) {
+	route, err := getHttpRouteByNameAndNamespace(name, namespace)
+	if err != nil {
+		return nil, err
+	}
+
+	apiNameLabel := getEnvOrDefault(EnvLabelAPINameKey, DefaultAPINameLabel)
+	apiName, has := route.GetLabels()[apiNameLabel]
+	if has && apiName != EmptyString {
+		loggers.LoggerWatcher.Debugf("EG finding related HTTPRoutes by %s=%s", apiNameLabel, apiName)
+		routes := listHTTPRoutesByLabel(namespace, apiNameLabel, apiName)
+		return routes, nil
+	}
+	return []*unstructured.Unstructured{route}, nil
+}
+
+// patchLabelsToHTTPRoute updates the labels of an HTTPRoute resource
+func patchLabelsToHTTPRoute(route *unstructured.Unstructured, labels map[string]string) error {
+	if CRWatcher == nil || CRWatcher.DynamicClient == nil {
+		return fmt.Errorf("CRWatcher or DynamicClient is not initialized")
+	}
+
+	// Prepare the patch in the format required by the Kubernetes API
+	loggers.LoggerWatcher.Debugf("EG patching labels on HTTPRoute %s/%s: %+v", route.GetNamespace(), route.GetName(), labels)
+	patch := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": labels,
+		},
+	}
+	patchBytes, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("failed to marshal patch: %v", err)
+	}
+
+	_, err = CRWatcher.DynamicClient.Resource(HTTPRouteGVR).Namespace(route.GetNamespace()).Patch(
+		context.Background(),
+		route.GetName(),
+		types.MergePatchType,
+		patchBytes,
+		metav1.PatchOptions{},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to patch HTTPRoute %s/%s: %v", route.GetNamespace(), route.GetName(), err)
+	}
+	loggers.LoggerWatcher.Infof("Successfully patched labels to HTTPRoute %s/%s", route.GetNamespace(), route.GetName())
+	return nil
+}
+
+func getLabelValue(route *unstructured.Unstructured, labelKey string) (string, bool) {
+	labels := route.GetLabels()
+	if labels == nil {
+		return "", false
+	}
+	val, ok := labels[labelKey]
+	return val, ok
 }

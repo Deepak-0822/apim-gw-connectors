@@ -187,30 +187,63 @@ func sendData() {
 	for event := range eventQueue {
 		loggers.LoggerWatcher.Infof("Processing event: %+v", event)
 
-		for {
-			if event.Event == managementserver.DeleteEvent {
-				managementserver.HandleDeleteEvent(event)
-			} else {
-				id, revisionID, err := managementserver.HandleCreateOrUpdateEvent(event)
-				if err != nil {
-					loggers.LoggerWatcher.Errorf("Event create or update error : %+v", err)
-				} else if id == "" {
-					loggers.LoggerWatcher.Error("Id field not present in response")
-					id = "" // Default to empty string if not found
-				} else if revisionID == "" {
-					loggers.LoggerWatcher.Error("Revision field not present in response")
-					revisionID = ""
+		if event.Event == managementserver.DeleteEvent {
+			retryable, err := managementserver.HandleDeleteEvent(event)
+			if err != nil {
+				if retryable && !constants.DisableRetryFeature() {
+					// Schedule a delayed, non-blocking re-enqueue to avoid blocking the consumer
+					delay := constants.GetEventRetryDelay()
+					loggers.LoggerWatcher.Warnf("Retryable error occurred: %+v. Re-queuing in %d seconds...", err, int(delay.Seconds()))
+					go func(e managementserver.APICPEvent) {
+						time.Sleep(delay)
+						select {
+						case eventQueue <- e:
+							loggers.LoggerWatcher.Debugf("Re-queued delete event for %s after delay", e.API.APIUUID)
+						default:
+							loggers.LoggerWatcher.Warnf("Event queue full, dropping retried delete event for API %s", e.API.APIUUID)
+						}
+					}(event)
 				}
-				loggers.LoggerWatcher.Infof("Adding label update to API Labels: apiUUID: %s, apiID: %s, revisionID: %s",
-					event.API.APIUUID, id, revisionID)
+				loggers.LoggerWatcher.Errorf("Event delete error : %+v", err)
+				// Move on to next event
+				continue
+			}
+		} else {
+			id, revisionID, retryable, err := managementserver.HandleCreateOrUpdateEvent(event)
+			if err != nil {
+				if retryable && !constants.DisableRetryFeature() {
+					// Schedule a delayed, non-blocking re-enqueue to avoid blocking the consumer
+					delay := constants.GetEventRetryDelay()
+					loggers.LoggerWatcher.Warnf("Retryable error occurred: %+v. Re-queuing in %d seconds...", err, int(delay.Seconds()))
+					go func(e managementserver.APICPEvent) {
+						time.Sleep(delay)
+						select {
+						case eventQueue <- e:
+							loggers.LoggerWatcher.Debugf("Re-queued create/update event for %s after delay", e.API.APIUUID)
+						default:
+							loggers.LoggerWatcher.Warnf("Event queue full, dropping retried create/update event for API %s", e.API.APIUUID)
+						}
+					}(event)
+				}
+				loggers.LoggerWatcher.Errorf("Event create or update error : %+v", err)
+				// Move on to next event
+				continue
 
-				if event.AgentName == constants.DefaultKongAgentName && id != "" {
-					if callback := managementserver.GetAPIImportCallback(); callback != nil && id != "" {
-						callback.OnAPIImportSuccess(event.UUID, id, revisionID, event.Name, event.Namespace, event.AgentName)
-					}
+			} else if id == "" {
+				loggers.LoggerWatcher.Error("Id field not present in response")
+				id = "" // Default to empty string if not found
+			} else if revisionID == "" {
+				loggers.LoggerWatcher.Error("Revision field not present in response")
+				revisionID = ""
+			}
+			loggers.LoggerWatcher.Infof("Adding label update to API Labels: apiUUID: %s, apiID: %s, revisionID: %s",
+				event.API.APIUUID, id, revisionID)
+
+			if event.AgentName == constants.GetEnvoyAgentName() && id != "" {
+				if callback := managementserver.GetAPIImportCallback(); callback != nil && id != "" {
+					callback.OnAPIImportSuccess(id, id, revisionID, event.Name, event.Namespace, event.AgentName)
 				}
 			}
-			break
 		}
 	}
 }

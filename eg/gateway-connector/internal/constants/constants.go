@@ -17,6 +17,8 @@
 
 package constants
 
+import "os"
+
 // Gateway related constants
 const (
 	GatewayName  = "wso2-apk-default"
@@ -33,3 +35,26 @@ const (
 	InternalKeySecretKey       = "wso2.crt"
 	InternalKeySuffix          = "-internal-key-issuer"
 )
+
+const (
+	LabelAPIID      = "apiID"
+	LabelRevisionID = "revisionID"
+	LabelAPIUUID    = "apiUUID"
+	LabelAPIHash    = "apiHash"
+)
+
+// Agent name handling
+// APIM_AGENT_NAME can be used to override the default agent name (defaults to "EG").
+// Keep a single place to derive this so all emits use the same value.
+const (
+	envAgentNameKey  = "APIM_AGENT_NAME"
+	defaultAgentName = "EG"
+)
+
+// GetAgentName returns the agent name from environment, falling back to defaultAgentName.
+func GetAgentName() string {
+	if v := os.Getenv(envAgentNameKey); v != "" {
+		return v
+	}
+	return defaultAgentName
+}

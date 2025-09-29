@@ -28,7 +28,7 @@ import (
 )
 
 // HandleDeleteEvent processes a delete event and returns an error if it fails
-func HandleDeleteEvent(event APICPEvent) error {
+func HandleDeleteEvent(event APICPEvent) (bool, error) {
 	cpConfig, err := config.ReadConfigs()
 	envLabel := []string{"Default"}
 	if err == nil {
@@ -36,31 +36,78 @@ func HandleDeleteEvent(event APICPEvent) error {
 	}
 
 	logger.LoggerMgtServer.Infof("Delete event received with APIUUID: %s", event.API.APIUUID)
-	payload := []map[string]interface{}{
-		{
-			"revisionUuid":       event.API.RevisionID,
-			"name":               envLabel[0],
-			"vhost":              event.API.Vhost,
-			"displayOnDevportal": true,
-		},
-	}
-	jsonPayload, err := json.Marshal(payload)
-	logger.LoggerMgtServer.Debugf("Sending payload for revision undeploy: %+v", string(jsonPayload))
+
+	// Fetch all revisions of the API
+	revisionsResp, retryableList, err := utils.ListAPIRevisions(event.API.APIUUID, "")
 	if err != nil {
-		logger.LoggerMgtServer.Errorf("Error while preparing payload to delete revision. Processed object: %+v", payload)
-		return fmt.Errorf("failed to marshal payload: %v", err)
+		logger.LoggerMgtServer.Errorf("Error while listing revisions for API ID: %s. Error: %+v", event.API.APIUUID, err)
+		return retryableList, fmt.Errorf("failed to list revisions: %v", err)
 	}
 
-	// Delete the API revision
-	if err := utils.DeleteAPIRevision(event.API.APIUUID, event.API.RevisionID, string(jsonPayload)); err != nil {
-		logger.LoggerMgtServer.Errorf("Error while undeploying api revision. RevisionId: %s, API ID: %s", event.API.RevisionID, event.API.APIUUID)
-		return fmt.Errorf("failed to undeploy revision: %v", err)
+	if revisionsResp == nil || revisionsResp.Count == 0 {
+		logger.LoggerMgtServer.Infof("No revisions found for API ID: %s", event.API.APIUUID)
+		return false, nil
 	}
-	return nil
+
+	var firstError error
+	retryable := false || retryableList
+	for _, rev := range revisionsResp.List {
+		// Try to get revision ID from common keys
+		var revID string
+		if v, ok := rev["id"].(string); ok && v != "" {
+			revID = v
+		} else if v, ok := rev["revisionId"].(string); ok && v != "" {
+			revID = v
+		} else if v, ok := rev["revisionUuid"].(string); ok && v != "" {
+			revID = v
+		} else if v, ok := rev["uuid"].(string); ok && v != "" {
+			revID = v
+		}
+
+		if revID == "" {
+			logger.LoggerMgtServer.Warnf("Skipping a revision entry without identifiable ID. Entry: %+v", rev)
+			continue
+		}
+
+		// Build payload per revision
+		payload := []map[string]interface{}{
+			{
+				"revisionUuid":       revID,
+				"name":               envLabel[0],
+				"vhost":              event.API.Vhost,
+				"displayOnDevportal": true,
+			},
+		}
+		jsonPayload, mErr := json.Marshal(payload)
+		if mErr != nil {
+			logger.LoggerMgtServer.Errorf("Error while preparing payload to delete revision %s. Error: %+v", revID, mErr)
+			if firstError == nil {
+				firstError = fmt.Errorf("failed to marshal payload for revision %s: %v", revID, mErr)
+			}
+			continue
+		}
+
+		// Delete the API revision (undeploy + delete)
+		retryableL, dErr := utils.DeleteAPIRevision(event.API.APIUUID, revID, string(jsonPayload))
+		if dErr != nil {
+			retryable = retryable || retryableL
+			logger.LoggerMgtServer.Errorf("Error while undeploying/deleting api revision. RevisionId: %s, API ID: %s, Error: %+v", revID, event.API.APIUUID, dErr)
+			if firstError == nil {
+				firstError = fmt.Errorf("failed to delete revision %s: %v", revID, dErr)
+			}
+			// Continue attempting to delete remaining revisions
+			continue
+		}
+	}
+
+	if firstError != nil {
+		return retryable, firstError
+	}
+	return false, nil
 }
 
 // HandleCreateOrUpdateEvent processes create or update events and returns id, revisionID, and error
-func HandleCreateOrUpdateEvent(event APICPEvent) (string, string, error) {
+func HandleCreateOrUpdateEvent(event APICPEvent) (string, string, bool, error) {
 	// Set default OpenAPI definition for REST APIs if missing
 	if strings.EqualFold(event.API.APIType, "rest") && event.API.Definition == "" {
 		event.API.Definition = utils.OpenAPIDefaultYaml
@@ -75,7 +122,7 @@ func HandleCreateOrUpdateEvent(event APICPEvent) (string, string, error) {
 	// Generate API and deployment YAMLs using the injected API YAML creator
 	if apiYamlCreator == nil {
 		logger.LoggerMgtServer.Errorf("API YAML creator not set.")
-		return "", "", fmt.Errorf("API YAML creator not configured")
+		return "", "", false, fmt.Errorf("API YAML creator not configured")
 	}
 	apiYaml, definition, endpointsYaml := apiYamlCreator.CreateAPIYaml(&event)
 	deploymentContent := CreateDeploymentYaml(event.API.Vhost)
@@ -122,14 +169,15 @@ func HandleCreateOrUpdateEvent(event APICPEvent) (string, string, error) {
 	var buf bytes.Buffer
 	if err := utils.CreateZipFile(&buf, zipFiles); err != nil {
 		logger.LoggerMgtServer.Errorf("Error while creating apim zip file for api uuid: %s. Error: %+v", event.API.APIUUID, err)
-		return "", "", fmt.Errorf("failed to create zip file: %v", err)
+		return "", "", false, fmt.Errorf("failed to create zip file: %v", err)
 	}
 
 	// Import API
-	id, revisionID, err := utils.ImportAPI(fmt.Sprintf("admin-%s-%s.zip", event.API.APIName, event.API.APIVersion), &buf)
+	id, revisionID, retryable, err := utils.ImportAPI(fmt.Sprintf("admin-%s-%s.zip", event.API.APIName, event.API.APIVersion), &buf)
+	_ = retryable // currently not used in this path
 	if err != nil {
 		logger.LoggerMgtServer.Errorf("Error while importing API.")
-		return "", "", fmt.Errorf("failed to import API: %v", err)
+		return "", "", retryable, fmt.Errorf("failed to import API: %v", err)
 	}
-	return id, revisionID, nil
+	return id, revisionID, false, nil
 }
