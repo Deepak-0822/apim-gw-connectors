@@ -52,7 +52,7 @@ metrics:
 agent:
   mode: CPtoDP
   gateway: eg
-  debug: true
+  debug: false
 certmanager:
   enabled: true
 logging:
