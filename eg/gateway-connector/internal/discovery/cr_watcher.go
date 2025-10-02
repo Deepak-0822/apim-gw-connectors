@@ -30,6 +30,7 @@ import (
 var (
 	configOnce sync.Once
 	CRWatcher  *commonDiscovery.CRWatcher
+	resourceMutex sync.Mutex
 )
 
 // IsControlPlaneInitiated checks if the resource was initiated from control plane
@@ -41,26 +42,44 @@ func IsControlPlaneInitiated(u *unstructured.Unstructured) bool {
 }
 
 func addResource(u *unstructured.Unstructured) {
+	resourceMutex.Lock()
+	defer resourceMutex.Unlock()
 	loggers.LoggerWatcher.Debugf("EG Resource Added: %s/%s (Kind: %s)", u.GetNamespace(), u.GetName(), u.GetKind())
 	if u.GetKind() == HTTPRouteKind && !IsControlPlaneInitiated(u) {
 		handleAddOrUpdateHTTPRoute(nil, u)
+	} else if u.GetKind() == SecurityPolicyKind && !IsControlPlaneInitiated(u) {
+		handleAddOrUpdateSecurityPolicy(u)
+	} else if u.GetKind() == BackendTrafficPolicyKind && !IsControlPlaneInitiated(u) {
+		handleAddOrUpdateBackendTrafficPolicy(u)
 	}
 }
 
 func updateResource(oldU, newU *unstructured.Unstructured) {
+	resourceMutex.Lock()
+	defer resourceMutex.Unlock()
 	if oldU.GetResourceVersion() == newU.GetResourceVersion() {
 		return
 	}
 	loggers.LoggerWatcher.Debugf("EG Resource Updated: %s/%s (Kind: %s)", newU.GetNamespace(), newU.GetName(), newU.GetKind())
 	if newU.GetKind() == HTTPRouteKind && !IsControlPlaneInitiated(newU) {
 		handleAddOrUpdateHTTPRoute(oldU, newU)
+	} else if newU.GetKind() == SecurityPolicyKind && !IsControlPlaneInitiated(newU) {
+		handleAddOrUpdateSecurityPolicy(newU)
+	} else if newU.GetKind() == BackendTrafficPolicyKind && !IsControlPlaneInitiated(newU) {
+		handleAddOrUpdateBackendTrafficPolicy(newU)
 	}
 }
 
 func deleteResource(u *unstructured.Unstructured) {
+	resourceMutex.Lock()
+	defer resourceMutex.Unlock()
 	loggers.LoggerWatcher.Debugf("EG Resource Deleted: %s/%s (Kind: %s)", u.GetNamespace(), u.GetName(), u.GetKind())
 	if u.GetKind() == HTTPRouteKind && !IsControlPlaneInitiated(u) {
 		handleDeleteHTTPRoute(u)
+	} else if u.GetKind() == SecurityPolicyKind && !IsControlPlaneInitiated(u) {
+		handleDeleteSecurityPolicy(u)
+	} else if u.GetKind() == BackendTrafficPolicyKind && !IsControlPlaneInitiated(u) {
+		handleDeleteBackendTrafficPolicy(u)
 	}
 }
 
@@ -69,7 +88,7 @@ func init() {
 		conf, _ := config.ReadConfigs()
 		CRWatcher = &commonDiscovery.CRWatcher{
 			Namespace:     conf.DataPlane.Namespace,
-			GroupVersions: []schema.GroupVersionResource{HTTPRouteGVR},
+			GroupVersions: []schema.GroupVersionResource{HTTPRouteGVR, SecurityPolicyGVR, BackendTrafficPolicyGVR},
 			AddFunc:       addResource,
 			UpdateFunc:    updateResource,
 			DeleteFunc:    deleteResource,

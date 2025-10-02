@@ -168,7 +168,7 @@ func CreateAPIYaml(apiCPEvent *APICPEvent, gatewayType string) (string, string, 
 
 	data := map[string]interface{}{
 		"type":    "api",
-		"version": "v4.5.0",
+		"version": "v4.6.0",
 		"data": map[string]interface{}{
 			"name":                         apiCPEvent.API.APIName,
 			"context":                      context,
@@ -180,7 +180,7 @@ func CreateAPIYaml(apiCPEvent *APICPEvent, gatewayType string) (string, string, 
 			"cacheTimeout":                 300,
 			"hasThumbnail":                 false,
 			"isDefaultVersion":             apiCPEvent.API.IsDefaultVersion,
-			"isRevision":                   false,
+			"isRevision":                   true,
 			"enableSchemaValidation":       false,
 			"enableSubscriberVerification": false,
 			"type":                         apiType,
@@ -226,7 +226,7 @@ func CreateAPIYaml(apiCPEvent *APICPEvent, gatewayType string) (string, string, 
 			},
 			"policies":             []string{"Unlimited"},
 			"gatewayType":          gatewayType,
-			"gatewayVendor":        "wso2",
+			"gatewayVendor":        "external",
 			"operations":           operations,
 			"additionalProperties": createAdditionalProperties(apiCPEvent.API.APIProperties),
 			"securityScheme":       apiCPEvent.API.SecurityScheme,
@@ -324,7 +324,8 @@ func CreateAPIYaml(apiCPEvent *APICPEvent, gatewayType string) (string, string, 
 												},
 											}
 										}
-										verbContentMap["x-auth-type"] = "Application & Application User"
+										verbContentMap["x-auth-type"] = operation.AuthType
+										verbContentMap["x-throttling-tier"] = operation.ThrottlingPolicy
 									}
 									break
 								}
@@ -466,7 +467,7 @@ func CreateAPIYaml(apiCPEvent *APICPEvent, gatewayType string) (string, string, 
 	if prodCount > 1 || sandCount > 1 {
 		endpointsData = map[string]interface{}{
 			"type":    "endpoints",
-			"version": "v4.5.0",
+			"version": "v4.6.0",
 			"data":    dataArr,
 		}
 	}
@@ -624,7 +625,7 @@ func extractOperations(event APICPEvent, apimEndpoints []APIMEndpoint) ([]APIOpe
 
 		for path, operations := range openAPIPaths.Paths {
 			for verb := range operations {
-				ptrToOperationFromDP := findMatchingAPKOperation(path, verb, event.API.Operations)
+				ptrToOperationFromDP := findMatchingAPKOperation(event.API.BasePath, path, verb, event.API.Operations)
 				if ptrToOperationFromDP == nil {
 					continue
 				}
@@ -755,8 +756,18 @@ func extractOperations(event APICPEvent, apimEndpoints []APIMEndpoint) ([]APIOpe
 				apiOp := APIOperation{
 					Target:           path,
 					Verb:             verb,
-					AuthType:         "Application & Application User",
-					ThrottlingPolicy: "Unlimited",
+					AuthType:         func() string { 
+						if !ptrToOperationFromDP.Secured {
+							return "None"
+						}
+						return "Application & Application User" 
+					}(),
+					ThrottlingPolicy: func() string {
+						if ptrToOperationFromDP.RatelimitConfigurationID == "" {
+							return "Unlimited"
+						}
+						return ptrToOperationFromDP.RatelimitConfigurationID
+					}(),
 					Scopes:           scopes,
 					OperationPolicies: OperationPolicies{
 						Request:  requestOperationPolicies,
@@ -775,14 +786,16 @@ func extractOperations(event APICPEvent, apimEndpoints []APIMEndpoint) ([]APIOpe
 	return []APIOperation{}, []ScopeWrapper{}, nil
 }
 
-func findMatchingAPKOperation(path string, verb string, operations []OperationFromDP) *OperationFromDP {
+func findMatchingAPKOperation(basePath string, path string, verb string, operations []OperationFromDP) *OperationFromDP {
 	for _, operationFromDP := range operations {
 		if strings.EqualFold(operationFromDP.Verb, verb) {
 			path = processOpenAPIPath(path)
 			if matchRegex(operationFromDP.Path, path) {
 				return &operationFromDP
 			}
-		}
+			if matchRegex(operationFromDP.Path, basePath+path) {
+				return &operationFromDP
+			}		}
 	}
 	return nil
 }

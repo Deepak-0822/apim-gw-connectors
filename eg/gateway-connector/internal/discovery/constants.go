@@ -21,13 +21,26 @@ import "k8s.io/apimachinery/pkg/runtime/schema"
 
 // GVRs to watch in EG discovery
 var (
-	HTTPRouteGVR = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}
+	HTTPRouteGVR      = schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}
+	SecurityPolicyGVR = schema.GroupVersionResource{
+		Group:    "gateway.envoyproxy.io",
+		Version:  "v1alpha1",
+		Resource: "securitypolicies",
+	}
+	BackendTrafficPolicyGVR = schema.GroupVersionResource{
+		Group:    "gateway.envoyproxy.io",
+		Version:  "v1alpha1",          
+		Resource: "backendtrafficpolicies", 
+	}
 	ConfigMapGVR = schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"}
 )
 
 // Core kinds/fields/labels
 const (
 	HTTPRouteKind  = "HTTPRoute"
+	SecurityPolicyKind = "SecurityPolicy"
+	BackendTrafficPolicyKind = "BackendTrafficPolicy"
+	ServiceKind    = "Service"
 	SpecField      = "spec"
 	RulesField     = "rules"
 	MatchesField   = "matches"
