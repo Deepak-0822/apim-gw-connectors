@@ -43,6 +43,13 @@ const (
 	LabelAPIHash    = "apiHash"
 )
 
+const (
+	EnvInProgressExpiryKey               = "APIM_INPROGRESS_EXPIRY"
+	DefaultInProgressExpiry              = "100"
+	EnvWaitTimeAfterInitialDiscoveryKey  = "APIM_WAIT_TIME_AFTER_INITIAL_DISCOVERY"
+	DefaultWaitTimeAfterInitialDiscovery = "1000"
+)
+
 // Agent name handling
 // APIM_AGENT_NAME can be used to override the default agent name (defaults to "EG").
 // Keep a single place to derive this so all emits use the same value.

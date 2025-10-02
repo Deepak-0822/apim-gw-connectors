@@ -20,6 +20,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/wso2-extensions/apim-gw-connectors/common-agent/config"
@@ -124,6 +126,44 @@ func HandleCreateOrUpdateEvent(event APICPEvent) (string, string, bool, error) {
 		logger.LoggerMgtServer.Errorf("API YAML creator not set.")
 		return "", "", false, fmt.Errorf("API YAML creator not configured")
 	}
+
+	// Create advanced throttling policies if specified in operations
+	for _, operation := range event.API.Operations {
+		if operation.RatelimitConfigurationID != "" && operation.RatelimitConfigurationID != "Unlimited" {
+			policy := utils.AdvancedThrottlePolicyInfo{
+				PolicyName:        operation.RatelimitConfigurationID,
+				DisplayName: 	operation.RatelimitConfigurationID,
+				Description: fmt.Sprintf("Auto-created policy %s for API %s", operation.RatelimitConfigurationID, event.API.APIName),
+				Type:  "AdvancedThrottlePolicyInfo",
+				IsDeployed: 	 true,
+				DefaultLimit: utils.ThrottleLimit{
+					Type: "REQUESTCOUNTLIMIT",
+					RequestCount: &utils.RequestCountLimit{
+						RequestCount: func() int64 {
+							if reqCount, _, valid := parseRateLimitIdentifier(operation.RatelimitConfigurationID); valid {
+								return reqCount
+							}
+							return 1 // Fallback to 1 if parsing fails
+						}(),
+						TimeUnit: func() string {
+							if _, unit, valid := parseRateLimitIdentifier(operation.RatelimitConfigurationID); valid {
+								return strings.ToUpper(unit)
+							}
+							return "MINUTE" // Fallback to MINUTE if parsing fails
+						}(),
+						UnitTime: 1,
+					},
+				},
+				
+			}
+			// TODO improve this logic to get all policies and check before adding
+			_, _, err := utils.AddAdvancedThrottlingPolicy(policy)
+			if err != nil {
+				logger.LoggerMgtServer.Errorf("Error while creating advanced throttling policy %s. Error: %+v", operation.RatelimitConfigurationID, err)
+			}
+		}
+	}
+
 	apiYaml, definition, endpointsYaml := apiYamlCreator.CreateAPIYaml(&event)
 	deploymentContent := CreateDeploymentYaml(event.API.Vhost)
 	logger.LoggerMgtServer.Debugf("Created apiYaml: %s, \n\n\n created definition file: %s", apiYaml, definition)
@@ -180,4 +220,24 @@ func HandleCreateOrUpdateEvent(event APICPEvent) (string, string, bool, error) {
 		return "", "", retryable, fmt.Errorf("failed to import API: %v", err)
 	}
 	return id, revisionID, false, nil
+}
+
+// parseRateLimitIdentifier parses strings like "100requestspersecond"
+// and returns (reqCount, unit, true) if valid.
+func parseRateLimitIdentifier(identifier string) (int64, string, bool) {
+	// Regex to match "<number>requestsper<unit>"
+	re := regexp.MustCompile(`^(\d+)requestsper([a-zA-Z]+)$`)
+	matches := re.FindStringSubmatch(strings.ToLower(identifier))
+	if len(matches) != 3 {
+		return 0, "", false
+	}
+
+	// Parse request count
+	reqCount, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return 0, "", false
+	}
+
+	unit := matches[2]
+	return int64(reqCount), unit, true
 }

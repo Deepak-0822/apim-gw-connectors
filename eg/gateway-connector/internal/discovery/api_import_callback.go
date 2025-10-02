@@ -17,9 +17,9 @@
 package discovery
 
 import (
-
-	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/loggers"
 	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/constants"
+	"github.com/wso2-extensions/apim-gw-connectors/eg/gateway-connector/internal/loggers"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
 // EnvoyAPIImportCallback implements the APIImportCallback interface for Envoy gateway connector
@@ -32,11 +32,31 @@ func (k *EnvoyAPIImportCallback) OnAPIImportSuccess(envoyAPIUUID, apiID, revisio
 		agentName, envoyAPIUUID, apiID, revisionID, crNamespace, crName)
 	// Get all related HTTPRoutes
 	hrs, err := getAllRelatedHttpRoutes(crName, crNamespace)
+	crsToHash := []*unstructured.Unstructured{}
 	if err != nil {
 		loggers.LoggerWatcher.Errorf("Failed to fetch HTTPRoutes for API %s: %v", envoyAPIUUID, err)
 		return
 	}
-	hash := computeAPIHash(hrs)
+	crsToHash = append(crsToHash, hrs...)
+	for _, hr := range hrs {
+		loggers.LoggerWatcher.Infof("Found related HTTPRoute %s/%s for API %s", hr.GetNamespace(), hr.GetName(), envoyAPIUUID)
+		sps, btps, err := getPoliciesTargetingHTTPRoute(hr)
+		if err != nil {
+			loggers.LoggerWatcher.Errorf("Failed to fetch policies for HTTPRoute %s/%s: %v", hr.GetNamespace(), hr.GetName(), err)
+			continue
+		}
+		if len(sps) > 0 {
+			loggers.LoggerWatcher.Infof("Found %d SecurityPolicies targeting HTTPRoute %s/%s", len(sps), hr.GetNamespace(), hr.GetName())
+			crsToHash = append(crsToHash, sps...)
+		}
+		if len(btps) > 0 {
+			loggers.LoggerWatcher.Infof("Found %d BackendTrafficPolicies targeting HTTPRoute %s/%s", len(btps), hr.GetNamespace(), hr.GetName())
+			crsToHash = append(crsToHash, btps...)
+		}
+	}
+
+	hash := computeAPIHash(crsToHash)
+	cache.Delete(hash) // Remove from in-progress cache if present
 	for _, hr := range hrs {
 		if err := patchLabelsToHTTPRoute(hr, map[string]string{
 			constants.LabelAPIID: apiID,

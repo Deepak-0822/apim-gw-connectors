@@ -224,11 +224,13 @@ type APKHeader struct {
 
 // OperationFromDP holds the path, verb, throttling and interceptor policy
 type OperationFromDP struct {
-	Path                   string                  `json:"path"`
-	Verb                   string                  `json:"verb"`
-	Scopes                 []string                `json:"scopes"`
-	Filters                []Filter                `json:"filters"`
-	AIModelBasedRoundRobin *AIModelBasedRoundRobin `json:"aiModelBasedRoundRobin"`
+	Path                     string                  `json:"path"`
+	Verb                     string                  `json:"verb"`
+	Scopes                   []string                `json:"scopes"`
+	Filters                  []Filter                `json:"filters"`
+	AIModelBasedRoundRobin   *AIModelBasedRoundRobin `json:"aiModelBasedRoundRobin"`
+	Secured                  bool                    `json:"secured"`
+	RatelimitConfigurationID string                  `json:"ratelimitConfigurationID"`
 }
 
 // Policy holds the policy name and version

@@ -528,7 +528,7 @@ const (
 	DefaultCacheTimeout     = 300
 	DefaultThrottlingPolicy = "Unlimited"
 	DefaultAuthType         = "Application & Application User"
-	DefaultYAMLAPIVersion   = "v4.5.0"
+	DefaultYAMLAPIVersion   = "v4.6.0"
 
 	// Transport Protocols
 	TransportHTTP  = "http"

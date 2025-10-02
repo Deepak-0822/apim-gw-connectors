@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 
+	gatewayv1alpha1 "github.com/envoyproxy/gateway/api/v1alpha1"
 	"github.com/google/uuid"
 	"github.com/wso2-extensions/apim-gw-connectors/common-agent/config"
 	commonDiscovery "github.com/wso2-extensions/apim-gw-connectors/common-agent/pkg/discovery"
@@ -38,14 +39,36 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gwapiv1a2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 )
 
 // handleAddOrUpdateHTTPRoute processes create/update for a single HTTPRoute
-func handleAddOrUpdateHTTPRoute(oldU, u *unstructured.Unstructured) {
-	loggers.LoggerWatcher.Infof("EG Processing HTTPRoute: %s/%s (rv: %s)", u.GetNamespace(), u.GetName(), u.GetResourceVersion())
+func handleAddOrUpdateHTTPRoute(oldU, newU *unstructured.Unstructured) {
+	var httpRoute gatewayv1.HTTPRoute
+	err := runtime.DefaultUnstructuredConverter.FromUnstructured(newU.Object, &httpRoute)
+	if err != nil {
+		// handle error
+		loggers.LoggerWatcher.Errorf("Failed to convert unstructured to HTTPRoute: %v", err)
+		return
+	}
+	httpRouteStatusOk := true
+	for _, parent := range httpRoute.Status.Parents {
+		for _, cond := range parent.Conditions {
+			if cond.Status != metav1.ConditionTrue || cond.ObservedGeneration != httpRoute.Generation {
+				loggers.LoggerWatcher.Infof("HTTPRoute %s/%s is not accepted or the latest is not processed yet by gateway. Observed generation: %d, Current generation: %d", newU.GetNamespace(), newU.GetName(), cond.ObservedGeneration, httpRoute.Generation)
+				httpRouteStatusOk = false
+				break
+			}
+		}
+	}
+	if !httpRouteStatusOk {
+		loggers.LoggerWatcher.Infof("EG HTTPRoute %s/%s is not accepted by gateway", newU.GetNamespace(), newU.GetName())
+		return
+	}
+	loggers.LoggerWatcher.Infof("EG Processing HTTPRoute: %s/%s (rv: %s)", newU.GetNamespace(), newU.GetName(), newU.GetResourceVersion())
 	// Compute hash to skip no-op updates
-	if oldU != nil && generateRouteHash(oldU) == generateRouteHash(u) {
-		loggers.LoggerWatcher.Debugf("EG HTTPRoute %s/%s unchanged, skipping", u.GetNamespace(), u.GetName())
+	if oldU != nil && generateRouteHash(oldU) == generateRouteHash(newU) {
+		loggers.LoggerWatcher.Debugf("EG HTTPRoute %s/%s unchanged, skipping", newU.GetNamespace(), newU.GetName())
 		return
 	}
 
@@ -54,10 +77,10 @@ func handleAddOrUpdateHTTPRoute(oldU, u *unstructured.Unstructured) {
 	apiSpecLabel := getEnvOrDefault(EnvLabelAPISpecKey, DefaultAPISpecLabel)
 
 	// Find the group of routes to process (by shared apiNameLabel)
-	routes := []*unstructured.Unstructured{u}
-	if val, ok := u.GetLabels()[apiNameLabel]; ok && val != EmptyString {
+	routes := []*unstructured.Unstructured{newU}
+	if val, ok := newU.GetLabels()[apiNameLabel]; ok && val != EmptyString {
 		loggers.LoggerWatcher.Debugf("EG grouping HTTPRoutes by label %s=%s", apiNameLabel, val)
-		routes = listHTTPRoutesByLabel(u.GetNamespace(), apiNameLabel, val)
+		routes = listHTTPRoutesByLabel(newU.GetNamespace(), apiNameLabel, val)
 	}
 
 	// If any route in group has the API spec label, fetch spec from ConfigMap
@@ -87,7 +110,7 @@ func handleAddOrUpdateHTTPRoute(oldU, u *unstructured.Unstructured) {
 	// Build desired API payload. Name and version derived from labels
 	apiName := deriveAPIName(routes, apiNameLabel)
 	apiVersion := deriveAPIVersion(routes)
-	apiUUID, _ := getLabelValue(u, constants.LabelAPIUUID)
+	apiUUID, _ := getLabelValue(newU, constants.LabelAPIUUID)
 
 	api := managementserver.API{
 		APIName:          apiName,
@@ -96,28 +119,44 @@ func handleAddOrUpdateHTTPRoute(oldU, u *unstructured.Unstructured) {
 		APIType:          "rest",
 		Definition:       definition,
 	}
-
+	
 	// Extract operations and vhost/basePath
 	updateAPIFromHTTPRoutes(&api, routes)
 
+	crsToHash := []*unstructured.Unstructured{}
+	crsToHash = append(crsToHash, routes...)
+	sps, btps, err := getPoliciesTargetingHTTPRoute(newU)
+	if err != nil {
+		loggers.LoggerWatcher.Errorf("EG failed to get policies targeting HTTPRoute %s/%s: %v", newU.GetNamespace(), newU.GetName(), err)
+	} else {
+		if len(sps) > 0 {
+			loggers.LoggerWatcher.Infof("Found %d SecurityPolicies targeting HTTPRoute %s/%s", len(sps), newU.GetNamespace(), newU.GetName())
+			crsToHash = append(crsToHash, sps...)
+		}
+		if len(btps) > 0 {
+			loggers.LoggerWatcher.Infof("Found %d BackendTrafficPolicies targeting HTTPRoute %s/%s", len(btps), newU.GetNamespace(), newU.GetName())
+			crsToHash = append(crsToHash, btps...)
+		}
+	}
 	// Hash and queue if changed
-	newHash := computeAPIHash(routes)
+	newHash := computeAPIHash(crsToHash)
+	
 	loggers.LoggerWatcher.Debugf("EG API hash unchanged: newHash=%s", newHash)
 	queue := false
-	if val, ok := u.GetLabels()[constants.LabelAPIHash]; ok && val != newHash {
+	if val, ok := newU.GetLabels()[constants.LabelAPIHash]; ok && val != newHash {
 		loggers.LoggerWatcher.Debugf("EG API hash changed: oldHash=%s, newHash=%s", val, newHash)
 		queue = true
 	} else if !ok {
 		loggers.LoggerWatcher.Debugf("EG API hash missing, setting newHash=%s", newHash)
 		queue = true
 	}
-	if queue {
+	if queue && !cache.Exists(newHash) {
+		cache.Add(newHash)
 		agentName := constants.GetAgentName()
 		commonDiscovery.QueueEvent(managementserver.CreateEvent, api, routes[0].GetName(), routes[0].GetNamespace(), agentName, apiUUID)
 		loggers.LoggerWatcher.Infof("EG queued API upsert: %s (%s)", apiName, apiUUID)
 	} else {
 		loggers.LoggerWatcher.Debugf("EG API unchanged: %s", apiUUID)
-
 	}
 }
 
@@ -180,6 +219,58 @@ func deriveAPIVersion(routes []*unstructured.Unstructured) string {
 
 func updateAPIFromHTTPRoutes(api *managementserver.API, routes []*unstructured.Unstructured) {
 	for _, u := range routes {
+		secured := false
+		rlID := ""
+		scopes := []string{}
+		sps, btps, errP := getPoliciesTargetingHTTPRoute(u)
+		if errP != nil {
+			loggers.LoggerWatcher.Errorf("EG failed to get policies targeting HTTPRoute: %v", errP)
+		}
+		if len(sps) > 0 {
+			sp := sps[0]
+			// Convert unstructured SecurityPolicy to typed Envoy Gateway object
+			var egSP gatewayv1alpha1.SecurityPolicy
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(sp.Object, &egSP); err != nil {
+				loggers.LoggerWatcher.Errorf("EG failed to convert unstructured to SecurityPolicy: %v", err)
+			} else {
+				loggers.LoggerWatcher.Debugf("EG converted SecurityPolicy to typed object: %s/%s", egSP.Namespace, egSP.Name)
+				if egSP.Spec.JWT != nil && len(egSP.Spec.JWT.Providers) > 0 {
+					secured = true
+				}
+				if egSP.Spec.Authorization != nil && len(egSP.Spec.Authorization.Rules) > 0 {
+					for _, rule := range egSP.Spec.Authorization.Rules {
+						if rule.Principal.JWT != nil && len(rule.Principal.JWT.Scopes) > 0 {
+							for _, s := range rule.Principal.JWT.Scopes {
+								scopes = append(scopes, string(s))
+							}
+						}
+					}
+				}
+			}
+		}
+		
+		// remove duplicates from scopes
+		scopeSet := make(map[string]struct{})
+		for _, s := range scopes {
+			scopeSet[s] = struct{}{}
+		}
+		scopes = scopes[:0]
+		for s := range scopeSet {
+			scopes = append(scopes, s)
+		}
+		if len(btps) > 0 {
+			btp := btps[0]
+			// Convert unstructured BackendTrafficPolicy to typed Envoy Gateway object
+			var egBTP gatewayv1alpha1.BackendTrafficPolicy
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(btp.Object, &egBTP); err != nil {
+				loggers.LoggerWatcher.Errorf("EG failed to convert unstructured to BackendTrafficPolicy: %v", err)
+			} else {
+				loggers.LoggerWatcher.Debugf("EG converted BackendTrafficPolicy to typed object: %s/%s", egBTP.Namespace, egBTP.Name)
+				if rateLimitID, ok := getRateLimitIdentifier(&egBTP); ok {
+					rlID = rateLimitID
+				}
+			}
+		}
 		// Convert unstructured -> typed HTTPRoute
 		var httpRoute gatewayv1.HTTPRoute
 		err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &httpRoute)
@@ -215,7 +306,7 @@ func updateAPIFromHTTPRoutes(api *managementserver.API, routes []*unstructured.U
 					endpointNamespace = string(*backendRef.Namespace)
 				}
 				// Compose endpoint URL (K8s DNS format)
-				prodEndpoint := fmt.Sprintf("http://%s.%s.svc.cluster.local:%s", endpointHost, endpointNamespace, endpointPort)
+				prodEndpoint := fmt.Sprintf("%s.%s.svc.cluster.local:%s", endpointHost, endpointNamespace, endpointPort)
 				api.ProdEndpoint = prodEndpoint
 			}
 			for _, match := range rule.Matches {
@@ -239,7 +330,9 @@ func updateAPIFromHTTPRoutes(api *managementserver.API, routes []*unstructured.U
 				op := managementserver.OperationFromDP{
 					Path:   p,
 					Verb:   method,
-					Scopes: []string{},
+					Scopes: scopes,
+					Secured: secured,
+					RatelimitConfigurationID: rlID,
 				}
 				if !operationExists(api.Operations, op) {
 					api.Operations = append(api.Operations, op)
@@ -289,17 +382,17 @@ func operationExists(ops []managementserver.OperationFromDP, newOp managementser
 	return false
 }
 
-func computeAPIHash(routes []*unstructured.Unstructured) string {
-	routeIds := make([]string, 0, len(routes))
-	for _, r := range routes {
+func computeAPIHash(crs []*unstructured.Unstructured) string {
+	crIds := make([]string, 0, len(crs))
+	for _, r := range crs {
 		if r == nil {
 			continue
 		}
-		id := fmt.Sprintf("%s_%d", r.GetName(), r.GetGeneration())
-		routeIds = append(routeIds, id)
+		id := fmt.Sprintf("%s_%d_%s", r.GetName(), r.GetGeneration(), r.GetUID())
+		crIds = append(crIds, id)
 	}
-	sort.Strings(routeIds)
-	data := strings.Join(routeIds, "|")
+	sort.Strings(crIds)
+	data := strings.Join(crIds, "|")
 	sum := sha256.Sum256([]byte(data))
 	fullHash := hex.EncodeToString(sum[:])
 
@@ -437,6 +530,120 @@ func getAllRelatedHttpRoutes(name, namespace string) ([]*unstructured.Unstructur
 	return []*unstructured.Unstructured{route}, nil
 }
 
+// getPoliciesTargetingHTTPRoute returns all SecurityPolicies and BackendTrafficPolicies that
+// reference the given HTTPRoute via spec.policyTargetReferences.targetRefs.
+// It searches within the route's namespace.
+func getPoliciesTargetingHTTPRoute(route *unstructured.Unstructured) (
+	securityPolicies []*unstructured.Unstructured,
+	backendTrafficPolicies []*unstructured.Unstructured,
+	err error,
+) {
+	if route == nil {
+		return nil, nil, fmt.Errorf("route is nil")
+	}
+	if CRWatcher == nil || CRWatcher.DynamicClient == nil {
+		return nil, nil, fmt.Errorf("CRWatcher or DynamicClient is not initialized")
+	}
+
+	ns := route.GetNamespace()
+
+	// List SecurityPolicies in the route's namespace
+	spList, spErr := CRWatcher.DynamicClient.Resource(SecurityPolicyGVR).Namespace(ns).List(
+		context.Background(), metav1.ListOptions{},
+	)
+	if spErr != nil {
+		err = fmt.Errorf("failed to list SecurityPolicies in %s: %w", ns, spErr)
+	} else {
+		for i := range spList.Items {
+			p := spList.Items[i]
+			if policyTargetsHTTPRoute(&p, route) && isPolicyAccepted(&p) {
+				cp := p // capture
+				securityPolicies = append(securityPolicies, &cp)
+			}
+		}
+	}
+
+	// List BackendTrafficPolicies in the route's namespace
+	btpList, btpErr := CRWatcher.DynamicClient.Resource(BackendTrafficPolicyGVR).Namespace(ns).List(
+		context.Background(), metav1.ListOptions{},
+	)
+	if btpErr != nil {
+		if err != nil {
+			// aggregate
+			err = fmt.Errorf("%v; and failed to list BackendTrafficPolicies in %s: %w", err, ns, btpErr)
+		} else {
+			err = fmt.Errorf("failed to list BackendTrafficPolicies in %s: %w", ns, btpErr)
+		}
+	} else {
+		for i := range btpList.Items {
+			p := btpList.Items[i]
+			if policyTargetsHTTPRoute(&p, route) && isPolicyAccepted(&p) {
+				cp := p // capture
+				backendTrafficPolicies = append(backendTrafficPolicies, &cp)
+			}
+		}
+	}
+
+	return securityPolicies, backendTrafficPolicies, err
+}
+
+// policyTargetsHTTPRoute checks whether a policy (SecurityPolicy/BackendTrafficPolicy)
+// targets the given HTTPRoute using LocalPolicyTargetReference semantics.
+func policyTargetsHTTPRoute(policy *unstructured.Unstructured, route *unstructured.Unstructured) bool {
+	if policy == nil || route == nil {
+		return false
+	}
+
+	routeName := route.GetName()
+	routeNS := route.GetNamespace()
+	policyNS := policy.GetNamespace()
+
+	switch policy.GetKind() {
+	case "SecurityPolicy":
+		var sp gatewayv1alpha1.SecurityPolicy
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(policy.Object, &sp); err != nil {
+			return false
+		}
+		if sp.Spec.PolicyTargetReferences.TargetRef != nil {
+			// Single targetRef case
+			return matchTargetRefs([]gwapiv1a2.LocalPolicyTargetReferenceWithSectionName{*sp.Spec.PolicyTargetReferences.TargetRef}, routeName, routeNS, policyNS)
+		}
+		return matchTargetRefs(sp.Spec.PolicyTargetReferences.TargetRefs, routeName, routeNS, policyNS)
+
+	case "BackendTrafficPolicy":
+		var bp gatewayv1alpha1.BackendTrafficPolicy
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(policy.Object, &bp); err != nil {
+			return false
+		}
+		if bp.Spec.PolicyTargetReferences.TargetRef != nil {
+			// Single targetRef case
+			return matchTargetRefs([]gwapiv1a2.LocalPolicyTargetReferenceWithSectionName{*bp.Spec.PolicyTargetReferences.TargetRef}, routeName, routeNS, policyNS)
+		}
+		return matchTargetRefs(bp.Spec.PolicyTargetReferences.TargetRefs, routeName, routeNS, policyNS)
+	}
+
+	return false
+}
+
+// matchTargetRefs checks if any of the targetRefs match the given route.
+func matchTargetRefs(refs []gwapiv1a2.LocalPolicyTargetReferenceWithSectionName, routeName, routeNS, policyNS string) bool {
+	for _, ref := range refs {
+		// Match kind/group for HTTPRoute
+		if !strings.EqualFold(string(ref.Kind), HTTPRouteKind) {
+			continue
+		}
+		if ref.Group != "" && string(ref.Group) != HTTPRouteGVR.Group {
+			continue
+		}
+		if string(ref.Name) != routeName {
+			continue
+		}
+
+		return true
+	}
+	return false
+}
+
 // patchLabelsToHTTPRoute updates the labels of an HTTPRoute resource
 func patchLabelsToHTTPRoute(route *unstructured.Unstructured, labels map[string]string) error {
 	if CRWatcher == nil || CRWatcher.DynamicClient == nil {
@@ -476,4 +683,34 @@ func getLabelValue(route *unstructured.Unstructured, labelKey string) (string, b
 	}
 	val, ok := labels[labelKey]
 	return val, ok
+}
+
+// getRequestsPerUnit extracts the requests-per-unit info from BTP
+func getRequestsPerUnit(egBTP *gatewayv1alpha1.BackendTrafficPolicy) (uint, string, bool) {
+    if egBTP.Spec.RateLimit != nil {
+        if egBTP.Spec.RateLimit.Global != nil && len(egBTP.Spec.RateLimit.Global.Rules) > 0 {
+            rule := egBTP.Spec.RateLimit.Global.Rules[0] // pick first rule
+            return rule.Limit.Requests, string(rule.Limit.Unit), true
+        }
+        if egBTP.Spec.RateLimit.Local != nil && len(egBTP.Spec.RateLimit.Local.Rules) > 0 {
+            rule := egBTP.Spec.RateLimit.Local.Rules[0]
+            return rule.Limit.Requests, string(rule.Limit.Unit), true
+        }
+    }
+    return 0, "", false
+}
+
+// getRateLimitIdentifier returns a string like "100requestsperminute"
+func getRateLimitIdentifier(egBTP *gatewayv1alpha1.BackendTrafficPolicy) (string, bool) {
+    if egBTP.Spec.RateLimit != nil {
+        if egBTP.Spec.RateLimit.Global != nil && len(egBTP.Spec.RateLimit.Global.Rules) > 0 {
+            rule := egBTP.Spec.RateLimit.Global.Rules[0]
+            return fmt.Sprintf("%drequestsper%s", rule.Limit.Requests, strings.ToLower(string(rule.Limit.Unit))), true
+        }
+        if egBTP.Spec.RateLimit.Local != nil && len(egBTP.Spec.RateLimit.Local.Rules) > 0 {
+            rule := egBTP.Spec.RateLimit.Local.Rules[0]
+            return fmt.Sprintf("%drequestsper%s", rule.Limit.Requests, strings.ToLower(string(rule.Limit.Unit))), true
+        }
+    }
+    return "", false
 }
